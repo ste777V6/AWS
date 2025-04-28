@@ -1,0 +1,697 @@
+Skip to content
+DEV Community
+Find related posts...
+Powered by  Algolia
+Log in
+Create account
+
+0
+Jump to Comments
+0
+Save
+Boost
+
+Cover image for Using AWS Lambda to Revert Unauthorized Security Group Changes
+AWS Community Builders  profile imagenoweder
+noweder for AWS Community Builders
+Posted on Jan 15, 2023
+
+
+5
+
+1
+
+1
+
+1
+
+1
+Using AWS Lambda to Revert Unauthorized Security Group Changes
+Introduction
+In this blog, we will demonstrate how to proactively monitor a web server EC2 security group for any traffic rule changes using Lambda along with a few other services. If we detect any unauthorized changes, we will then undo them using Lambda. There will also be an SNS notification sent out to the admins, which is us.
+
+In this activity we will be working with the following AWS services:
+
+Lambda
+
+SNS
+
+CloudTrail
+
+CloudWatch
+
+CloudFormation
+
+EC2
+
+VPC
+
+S3
+
+This scenario is a working example of how we can use Lambda to perform various operational tasks within our account, especially ones that maintain our security posture.
+
+Architecture
+The below diagram illustrates the high-level architecture and the steps to be followed in sequence.
+
+Image description
+
+Prerequisites
+An AWS account
+
+An existing VPC such as the default VPC
+
+Steps
+Create Your CloudTrail Trail
+Navigate to the CloudTrail service. From the left-hand menu, access Trails and click on Create trail.
+
+Image description
+
+Specify your desired name for the trail
+
+For Storage location section, choose New S3 bucket and keep the default generated name. This will create an S3 bucket to load API event trail logs.
+
+Enable CloudWatch Logs to create a log group to which the trail will send events.
+
+Choose Event type as Management events
+
+Choose API activity to log both Read and Write activities.
+
+Leave other settings as is and finally click Create trail.
+
+Deploy the CloudFormation Template
+The CloudFormation template will create several resources:
+
+A web security group that is monitored for any changes
+
+An IAM role attached to the Lambda function as an execution role with permissions to remove any changes to the security group inbound rules.
+
+A Lambda Permission which allows CloudWatch Events to invoke the Lambda function
+
+A Lambda function that revokes any changes to the web security group and publishes a message to an SNS topic
+
+A CloudWatch Event Rule that captures security group change events and triggers the Lambda function (Note: CloudWatch Events is now Amazon EventBridge)
+
+SNS topic with an email subscription to send an email notification when the Lambda function is invoked
+
+Follow the below steps to deploy these resources:
+
+Using your preferred code editor, create a .yaml file with the below CloudFormation template.
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Creates the resources necessary to create a rule to monitor and
+  auto-mitigate security group change events
+
+Metadata:
+  License:
+    Description: |
+      Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+      Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance with the License. A copy of the License is located at
+
+          http://aws.amazon.com/apache2.0/
+
+      or in the "license" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Settings
+        Parameters:
+          - NotificationEmailAddress
+
+    ParameterLabels:
+      NotificationEmailAddress:
+        default: Send notifications to
+
+Parameters:
+
+  NotificationEmailAddress:
+    Description: |
+      This is the email address that will receive change notifications. You will
+      receive a confirmation email that you must accept before you will receive
+      notifications.
+    Type: String
+
+Conditions:
+
+  AddEmailNotificationSubscription:
+    !Not [!Equals [!Ref NotificationEmailAddress, ""]]
+
+Resources:
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS access to web servers
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Web Server Security Group
+
+  SecurityGroupChangeAutoResponseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        -
+          PolicyName: SecurityGroupModification
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Sid: AllowSecurityGroupActions
+                Effect: Allow
+                Action:
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${WebServerSecurityGroup.GroupId}
+              -
+                Sid: AllowSnsActions
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SnsTopicForCloudWatchEvent
+
+  SecurityGroupChangeAutoResponse:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Responds to security group changes
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt SecurityGroupChangeAutoResponseRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Environment:
+        Variables:
+          security_group_id: !GetAtt WebServerSecurityGroup.GroupId
+          sns_topic_arn: !Ref SnsTopicForCloudWatchEvent
+      Code:
+        ZipFile: |
+          import os, json, boto3
+
+          #===============================================================================
+          def lambda_handler(event, context):
+
+              print(event)
+
+              # Ensure that we have an event name to evaluate.
+              if 'detail' not in event or ('detail' in event and 'eventName' not in event['detail']):
+                  return {"Result": "Failure", "Message": "Lambda not triggered by an event"}
+
+              # Remove the rule only if the event was to authorize the ingress rule for the given
+              # security group that was injected during CloudFormation execution.
+              if (event['detail']['eventName'] == 'AuthorizeSecurityGroupIngress' and
+                  event['detail']['requestParameters']['groupId'] == os.environ['security_group_id']):
+                  result = revoke_security_group_ingress(event['detail'])
+
+                  message = "AUTO-MITIGATED: Ingress rule removed from security group: {} that was added by {}: {}".format(
+                          result['group_id'],
+                          result['user_name'],
+                          json.dumps(result['ip_permissions'])
+                          )
+
+                  boto3.client('sns').publish(
+                    TargetArn = os.environ['sns_topic_arn'],
+                    Message = message,
+                    Subject = "Auto-mitigation successful"
+                    )
+
+
+          #===============================================================================
+          def revoke_security_group_ingress(event_detail):
+
+              request_parameters = event_detail['requestParameters']
+
+              # Build the normalized IP permission JSON struture.
+              ip_permissions = normalize_paramter_names(request_parameters['ipPermissions']['items'])
+
+              response = boto3.client('ec2').revoke_security_group_ingress(
+                  GroupId = request_parameters['groupId'],
+                  IpPermissions = ip_permissions
+                  )
+
+              # Build the result
+              result = {}
+              result['group_id'] = request_parameters['groupId']
+              result['user_name'] = event_detail['userIdentity']['arn']
+              result['ip_permissions'] = ip_permissions
+
+              return result
+
+
+          #===============================================================================
+          def normalize_paramter_names(ip_items):
+
+              # Start building the permissions items list.
+              new_ip_items = []
+
+              # First, build the basic parameter list.
+              for ip_item in ip_items:
+
+                  new_ip_item = {
+                      "IpProtocol": ip_item['ipProtocol'],
+                      "FromPort": ip_item['fromPort'],
+                      "ToPort": ip_item['toPort']
+                  }
+
+                  #CidrIp or CidrIpv6 (IPv4 or IPv6)?
+                  if 'ipv6Ranges' in ip_item and ip_item['ipv6Ranges']:
+                      # This is an IPv6 permission range, so change the key names.
+                      ipv_range_list_name = 'ipv6Ranges'
+                      ipv_address_value = 'cidrIpv6'
+                      ipv_range_list_name_capitalized = 'Ipv6Ranges'
+                      ipv_address_value_capitalized = 'CidrIpv6'
+                  else:
+                      ipv_range_list_name = 'ipRanges'
+                      ipv_address_value = 'cidrIp'
+                      ipv_range_list_name_capitalized = 'IpRanges'
+                      ipv_address_value_capitalized = 'CidrIp'
+
+                  ip_ranges = []
+
+                  # Next, build the IP permission list.
+                  for item in ip_item[ipv_range_list_name]['items']:
+                      ip_ranges.append(
+                          {ipv_address_value_capitalized : item[ipv_address_value]}
+                          )
+
+                  new_ip_item[ipv_range_list_name_capitalized] = ip_ranges
+
+                  new_ip_items.append(new_ip_item)
+
+              return new_ip_items
+
+  SecurityGroupChangeAutoResponseLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      FunctionName: !Ref SecurityGroupChangeAutoResponse
+
+  TriggeredRuleForSecurityGroupChangeAutoResponse:
+    Type: AWS::Events::Rule
+    Properties:
+      #Name: SecurityGroupChangeAutoResponse
+      Description: Responds to security group change events
+      EventPattern:
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - AuthorizeSecurityGroupEgress
+            - RevokeSecurityGroupEgress
+            - RevokeSecurityGroupIngress
+            - CreateSecurityGroup
+            - DeleteSecurityGroup
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt SecurityGroupChangeAutoResponse.Arn
+          Id: TargetFunctionV1
+
+  SnsTopicForCloudWatchEvent:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Broadcasts message to subscribers
+
+  SnsTopicSubscriptionForCloudWatchEvent:
+    Type: AWS::SNS::Subscription
+    Condition: AddEmailNotificationSubscription
+    Properties:
+      TopicArn: !Ref SnsTopicForCloudWatchEvent
+      Endpoint: !Ref NotificationEmailAddress
+      Protocol: email
+Navigate to CloudFormation service and click on Create stack.
+
+Click on Upload a template file from the Specify template section and choose the locally created .yaml file, then click Next.
+
+Specify your desired name of the stack.
+
+Enter your email address in the Parameters section under Send notifications to parameter.
+
+Image description
+
+Leave everything else as is and click on Submit at the end.
+
+Once the stack status changes to CREATE_COMPLETE, you should receive an email from AWS to confirm the subscription to the SNS topic. Click on Confirm subscription link within the email bod
+
+Test and Verify The Solution
+Head to EC2 in the console and access Security Groups under Network & Security. Select the created Web Server Security Group and click on Edit inbound rules.
+
+Click on Add rule. Select SSH as Type and Anywhere-IPv4 as the Source. Then click on Save rules.
+
+Image description
+
+Once this change is done, CloudTrail will catch this event and send it to CloudWatch, which will trigger the deployed event rule and pass the data to the Lambda function. The function will parse that data and do two things; it will remove the rule we added, and also publish to the SNS topic which will send an email to the defined email address.
+
+Refresh the inbound rules and you will notice the newly added rule has been immediately removed!
+
+Image description
+
+You will also receive a notification email mentioning that the added ingress rule has been removed as shown below.
+
+Image description
+
+We can also view the metrics of the successful lambda function invocation from the Monitor menu of the function as shown below.
+
+Image description
+
+Until next time...
+
+Thanks for reading!
+
+profile
+Quadratic AI
+PROMOTED
+
+Quadratic AI
+
+Quadratic AI – The Spreadsheet with AI, Code, and Connections
+AI-Powered Insights: Ask questions in plain English and get instant visualizations
+Multi-Language Support: Seamlessly switch between Python, SQL, and JavaScript in one workspace
+Zero Setup Required: Connect to databases or drag-and-drop files straight from your browser
+Live Collaboration: Work together in real-time, no matter where your team is located
+Beyond Formulas: Tackle complex analysis that traditional spreadsheets can't handle
+Get started for free.
+
+Watch The Demo 📊✨
+
+Read More
+Top comments (0)
+Subscribe
+pic
+Add to the discussion
+Code of Conduct • Report abuse
+profile
+AWS Community Builders
+
+Best Practices for Running  Container WordPress on AWS (ECS, EFS, RDS, ELB) using CDK cover image
+
+Best Practices for Running Container WordPress on AWS (ECS, EFS, RDS, ELB) using CDK
+This post discusses the process of migrating a growing WordPress eShop business to AWS using AWS CDK for an easily scalable, high availability architecture. The detailed structure encompasses several pillars: Compute, Storage, Database, Cache, CDN, DNS, Security, and Backup.
+
+Read full post
+
+
+AWS Community Builders
+Follow
+Build On!
+Would you like to become an AWS Community Builder? Learn more about the program and apply to join when applications are open next.
+
+Learn more
+More from AWS Community Builders
+Phantom DNS Query to GCP VM Metadata Service in My AWS Workload 👻 — Revealed by Route 53 Resolver Logging 🔍
+#aws #security #dns #firewall
+[AWS] I want to tell you how good InfraStructureComposer is [DevTools]
+#aws #devtools #infrastructureascode
+Import Cross Account AWS DynamoDB data from S3 bucket to DynamoDB using Python Boto3
+#python #boto3 #dynamodb #s3
+profile
+AWS Community Builders
+
+My AWS Solution Architect Professional study guide cover image
+
+My AWS Solution Architect Professional study guide
+Study guide for AWS Solution Architect Professional exam preparation, covering courses, practice exams, and exam tips along with labs for hands-on practice.
+
+Read full post
+
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Creates the resources necessary to create a rule to monitor and
+  auto-mitigate security group change events
+
+Metadata:
+  License:
+    Description: |
+      Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+      Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance with the License. A copy of the License is located at
+
+          http://aws.amazon.com/apache2.0/
+
+      or in the "license" file accompanying this file. This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
+
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Settings
+        Parameters:
+          - NotificationEmailAddress
+
+    ParameterLabels:
+      NotificationEmailAddress:
+        default: Send notifications to
+
+Parameters:
+
+  NotificationEmailAddress:
+    Description: |
+      This is the email address that will receive change notifications. You will
+      receive a confirmation email that you must accept before you will receive
+      notifications.
+    Type: String
+
+Conditions:
+
+  AddEmailNotificationSubscription:
+    !Not [!Equals [!Ref NotificationEmailAddress, ""]]
+
+Resources:
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTPS access to web servers
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Web Server Security Group
+
+  SecurityGroupChangeAutoResponseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        -
+          PolicyName: SecurityGroupModification
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Sid: AllowSecurityGroupActions
+                Effect: Allow
+                Action:
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${WebServerSecurityGroup.GroupId}
+              -
+                Sid: AllowSnsActions
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SnsTopicForCloudWatchEvent
+
+  SecurityGroupChangeAutoResponse:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Responds to security group changes
+      Handler: index.lambda_handler
+      MemorySize: 1024
+      Role: !GetAtt SecurityGroupChangeAutoResponseRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Environment:
+        Variables:
+          security_group_id: !GetAtt WebServerSecurityGroup.GroupId
+          sns_topic_arn: !Ref SnsTopicForCloudWatchEvent
+      Code:
+        ZipFile: |
+          import os, json, boto3
+
+          #===============================================================================
+          def lambda_handler(event, context):
+
+              print(event)
+
+              # Ensure that we have an event name to evaluate.
+              if 'detail' not in event or ('detail' in event and 'eventName' not in event['detail']):
+                  return {"Result": "Failure", "Message": "Lambda not triggered by an event"}
+
+              # Remove the rule only if the event was to authorize the ingress rule for the given
+              # security group that was injected during CloudFormation execution.
+              if (event['detail']['eventName'] == 'AuthorizeSecurityGroupIngress' and
+                  event['detail']['requestParameters']['groupId'] == os.environ['security_group_id']):
+                  result = revoke_security_group_ingress(event['detail'])
+
+                  message = "AUTO-MITIGATED: Ingress rule removed from security group: {} that was added by {}: {}".format(
+                          result['group_id'],
+                          result['user_name'],
+                          json.dumps(result['ip_permissions'])
+                          )
+
+                  boto3.client('sns').publish(
+                    TargetArn = os.environ['sns_topic_arn'],
+                    Message = message,
+                    Subject = "Auto-mitigation successful"
+                    )
+
+
+          #===============================================================================
+          def revoke_security_group_ingress(event_detail):
+
+              request_parameters = event_detail['requestParameters']
+
+              # Build the normalized IP permission JSON struture.
+              ip_permissions = normalize_paramter_names(request_parameters['ipPermissions']['items'])
+
+              response = boto3.client('ec2').revoke_security_group_ingress(
+                  GroupId = request_parameters['groupId'],
+                  IpPermissions = ip_permissions
+                  )
+
+              # Build the result
+              result = {}
+              result['group_id'] = request_parameters['groupId']
+              result['user_name'] = event_detail['userIdentity']['arn']
+              result['ip_permissions'] = ip_permissions
+
+              return result
+
+
+          #===============================================================================
+          def normalize_paramter_names(ip_items):
+
+              # Start building the permissions items list.
+              new_ip_items = []
+
+              # First, build the basic parameter list.
+              for ip_item in ip_items:
+
+                  new_ip_item = {
+                      "IpProtocol": ip_item['ipProtocol'],
+                      "FromPort": ip_item['fromPort'],
+                      "ToPort": ip_item['toPort']
+                  }
+
+                  #CidrIp or CidrIpv6 (IPv4 or IPv6)?
+                  if 'ipv6Ranges' in ip_item and ip_item['ipv6Ranges']:
+                      # This is an IPv6 permission range, so change the key names.
+                      ipv_range_list_name = 'ipv6Ranges'
+                      ipv_address_value = 'cidrIpv6'
+                      ipv_range_list_name_capitalized = 'Ipv6Ranges'
+                      ipv_address_value_capitalized = 'CidrIpv6'
+                  else:
+                      ipv_range_list_name = 'ipRanges'
+                      ipv_address_value = 'cidrIp'
+                      ipv_range_list_name_capitalized = 'IpRanges'
+                      ipv_address_value_capitalized = 'CidrIp'
+
+                  ip_ranges = []
+
+                  # Next, build the IP permission list.
+                  for item in ip_item[ipv_range_list_name]['items']:
+                      ip_ranges.append(
+                          {ipv_address_value_capitalized : item[ipv_address_value]}
+                          )
+
+                  new_ip_item[ipv_range_list_name_capitalized] = ip_ranges
+
+                  new_ip_items.append(new_ip_item)
+
+              return new_ip_items
+
+  SecurityGroupChangeAutoResponseLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      FunctionName: !Ref SecurityGroupChangeAutoResponse
+
+  TriggeredRuleForSecurityGroupChangeAutoResponse:
+    Type: AWS::Events::Rule
+    Properties:
+      #Name: SecurityGroupChangeAutoResponse
+      Description: Responds to security group change events
+      EventPattern:
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - AuthorizeSecurityGroupEgress
+            - RevokeSecurityGroupEgress
+            - RevokeSecurityGroupIngress
+            - CreateSecurityGroup
+            - DeleteSecurityGroup
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt SecurityGroupChangeAutoResponse.Arn
+          Id: TargetFunctionV1
+
+  SnsTopicForCloudWatchEvent:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Broadcasts message to subscribers
+
+  SnsTopicSubscriptionForCloudWatchEvent:
+    Type: AWS::SNS::Subscription
+    Condition: AddEmailNotificationSubscription
+    Properties:
+      TopicArn: !Ref SnsTopicForCloudWatchEvent
+      Endpoint: !Ref NotificationEmailAddress
+      Protocol: email
+Thank you to our Diamond Sponsor Neon for supporting our community.
+
+DEV Community — A constructive and inclusive social network for software developers. With you every step of your journey.
+
+Home
+DEV++
+Podcasts
+Videos
+Tags
+DEV Help
+Forem Shop
+Advertise on DEV
+DEV Challenges
+DEV Showcase
+About
+Contact
+Free Postgres Database
+Software comparisons
+Code of Conduct
+Privacy Policy
+Terms of use
+Built on Forem — the open source software that powers DEV and other inclusive communities.
+
+Made with love and Ruby on Rails. DEV Community © 2016 - 2025.
